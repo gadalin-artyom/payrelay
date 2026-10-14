@@ -1,5 +1,3 @@
-"""Unit-тесты валидации схем создания платежа (U01–U04)."""
-
 from __future__ import annotations
 
 from decimal import Decimal

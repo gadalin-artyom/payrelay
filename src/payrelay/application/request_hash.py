@@ -1,5 +1,3 @@
-"""Канонический SHA-256 хэш тела запроса на создание платежа."""
-
 from __future__ import annotations
 
 import hashlib

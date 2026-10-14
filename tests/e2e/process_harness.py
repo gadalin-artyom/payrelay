@@ -1,10 +1,3 @@
-"""Orchestration реальных entrypoints для process-level E2E.
-
-Запускает ``api``, ``outbox-publisher`` и ``consumer`` как отдельные
-subprocess в том же контейнере/хосте, что и pytest. Не заменяет бизнес-логику
-прямыми вызовами ``process_payment`` / ``outbox_dispatcher``.
-"""
-
 from __future__ import annotations
 
 import os

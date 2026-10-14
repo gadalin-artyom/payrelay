@@ -1,9 +1,11 @@
 # PayRelay Compose.
-# Обычный профиль: postgres, rabbitmq, api, consumer, outbox-publisher.
+# Обычный профиль: postgres, rabbitmq, api, consumer, outbox-publisher,
+# docker-socket-proxy, dozzle.
 # Profile `test`: postgres-test, rabbitmq-test, tests (порты наружу не публикуются).
 #
 # Миграции: `uv run alembic upgrade head` (или через сервис tests / api).
 # Приложение само upgrade не выполняет — схема готовится отдельно.
+# Dozzle UI: http://127.0.0.1:${DOZZLE_PORT:-9999} (Docker API через read-only socket-proxy).
 
 name: payrelay
 
@@ -34,7 +36,8 @@ services:
       - rabbitmq_data:/var/lib/rabbitmq
     ports:
       - "5672:5672"
-      - "15672:15672"
+      # Management UI только на loopback (не публиковать наружу).
+      - "127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 5s
@@ -119,6 +122,55 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    environment:
+      # Минимальный read-only набор для списка контейнеров и логов Dozzle.
+      CONTAINERS: 1
+      EVENTS: 1
+      INFO: 1
+      # Mutating / shell / actions выключены (POST по умолчанию запрещён).
+      AUTH: 0
+      BUILD: 0
+      COMMIT: 0
+      CONFIGS: 0
+      DISTRIBUTION: 0
+      EXEC: 0
+      IMAGES: 0
+      NETWORKS: 0
+      NODES: 0
+      PLUGINS: 0
+      SECRETS: 0
+      SERVICES: 0
+      SESSION: 0
+      SWARM: 0
+      SYSTEM: 0
+      TASKS: 0
+      VOLUMES: 0
+      POST: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - monitoring_internal
+    restart: unless-stopped
+
+  dozzle:
+    image: amir20/dozzle:v8.12.0
+    environment:
+      DOZZLE_REMOTE_HOST: tcp://docker-socket-proxy:2375
+      DOZZLE_NO_ANALYTICS: "true"
+      # Частичное совпадение имени: payrelay-api-1, payrelay-consumer-1, ...
+      DOZZLE_FILTER: name=payrelay
+      # actions/shell по умолчанию выключены; mutating POST на proxy запрещён.
+      DOZZLE_ENABLE_ACTIONS: "false"
+    ports:
+      - "127.0.0.1:${DOZZLE_PORT:-9999}:8080"
+    depends_on:
+      - docker-socket-proxy
+    networks:
+      - monitoring_internal
+    restart: unless-stopped
+
   postgres-test:
     profiles: ["test"]
     image: postgres:16-alpine
@@ -185,3 +237,7 @@ volumes:
   rabbitmq_data:
   postgres_test_data:
   rabbitmq_test_data:
+
+networks:
+  monitoring_internal:
+    driver: bridge

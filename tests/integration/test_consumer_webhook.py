@@ -1,8 +1,3 @@
-"""Integration-тесты consumer + gateway + webhook (этап 004).
-
-I06–I08, I12–I13, lease/concurrency, HTTP failure. Только postgres-test / rabbitmq-test.
-"""
-
 from __future__ import annotations
 
 import json

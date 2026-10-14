@@ -1,5 +1,3 @@
-"""Общие фикстуры pytest для PayRelay."""
-
 from __future__ import annotations
 
 from collections.abc import Iterator

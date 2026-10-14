@@ -1,5 +1,3 @@
-"""FastStream consumer: payment.created / payment.webhook_retry + system retry."""
-
 from __future__ import annotations
 
 import logging

@@ -1,5 +1,3 @@
-"""Точка входа роли outbox-publisher."""
-
 from __future__ import annotations
 
 import asyncio

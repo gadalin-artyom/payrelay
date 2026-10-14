@@ -1,1 +1,0 @@
-"""Инфраструктура messaging (RabbitMQ / FastStream)."""

@@ -1,5 +1,3 @@
-"""Чистые правила webhook/system retry (без I/O)."""
-
 from __future__ import annotations
 
 from payrelay.domain.enums import OutboxEventType

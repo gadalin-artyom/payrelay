@@ -1,5 +1,3 @@
-"""HTTP-доставка webhook мерчанту."""
-
 from payrelay.infrastructure.webhooks.http_client import (
     WebhookDeliveryResult,
     WebhookHttpClient,

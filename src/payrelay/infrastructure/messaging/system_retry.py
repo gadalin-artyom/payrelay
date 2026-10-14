@@ -1,5 +1,3 @@
-"""Публикация bounded system retry в TTL-очереди RabbitMQ."""
-
 from __future__ import annotations
 
 import logging

@@ -1,5 +1,3 @@
-"""U10/U11/lease/HTTP: ProcessPaymentService с фейками без реальной сети."""
-
 from __future__ import annotations
 
 import uuid

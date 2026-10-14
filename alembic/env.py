@@ -1,5 +1,3 @@
-"""Alembic env: async PostgreSQL (asyncpg) миграции PayRelay."""
-
 from __future__ import annotations
 
 import asyncio

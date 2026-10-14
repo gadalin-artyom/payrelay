@@ -20,6 +20,9 @@
 | U14 | Дубликат AMQP после commit retry / после успеха | нет нового Outbox/HTTP; gateway не вызывается |
 | U15 | system_attempt 1→2→3; poison payload | TTL retry confirm-before-ACK; #3/poison → DLQ |
 | U16 | Запрещённый private/loopback webhook URL | отклонён production policy |
+| U17 | Публичные 401/404/409/422/500 — русские detail | коды HTTP и формат detail сохранены |
+| U18 | OpenAPI: security X-API-Key, Idempotency-Key, русские примеры | schema содержит описания |
+| U19 | Нет module-level docstring в src/tests/alembic | AST-проверка; function/class docstring есть |
 
 ## Integration (реальные test PostgreSQL и RabbitMQ)
 

@@ -1,5 +1,3 @@
-"""U09: детерминированный Gateway Simulator."""
-
 from __future__ import annotations
 
 import uuid

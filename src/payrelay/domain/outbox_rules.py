@@ -1,5 +1,3 @@
-"""Чистые правила доступности Outbox и backoff публикации."""
-
 from __future__ import annotations
 
 from datetime import datetime

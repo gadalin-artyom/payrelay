@@ -1,5 +1,3 @@
-"""Фабрика FastAPI-приложения."""
-
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
@@ -10,6 +8,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from payrelay.api.dependencies import require_api_key
+from payrelay.api.exception_handlers import register_exception_handlers
 from payrelay.api.routers.payments import router as payments_router
 from payrelay.core.config import Settings, get_settings
 from payrelay.infrastructure.db.session import create_engine, create_session_factory
@@ -53,18 +52,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="PayRelay",
         version="0.1.0",
+        description=(
+            "Асинхронный сервис приёма платежей. "
+            "Авторизация: заголовок X-API-Key (кнопка Authorize в Swagger). "
+            "Для POST /api/v1/payments клиент обязан передать Idempotency-Key "
+            "(рекомендуется UUID v4). Сообщения об ошибках API — на русском; "
+            "идентификаторы полей и заголовков не локализуются. "
+            "Документация доступна только при ENABLE_DOCS=true вне production."
+        ),
         docs_url=docs_url,
         redoc_url=redoc_url,
         openapi_url=openapi_url,
         lifespan=_lifespan,
     )
     app.state.settings = resolved
+    register_exception_handlers(app)
     app.include_router(payments_router)
 
     @app.get(
         "/health/live",
         tags=["health"],
-        summary="Liveness probe",
+        summary="Проверка жизнеспособности",
+        description="Liveness probe. Требует валидный X-API-Key.",
         dependencies=[Depends(require_api_key)],
     )
     async def health_live() -> JSONResponse:

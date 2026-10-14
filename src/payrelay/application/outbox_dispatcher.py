@@ -1,5 +1,3 @@
-"""Диспетчер Outbox: claim → publish confirm → mark published."""
-
 from __future__ import annotations
 
 import logging

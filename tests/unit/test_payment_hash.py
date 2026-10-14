@@ -1,5 +1,3 @@
-"""Unit-тесты канонического request_hash (U05/U06 на уровне хэша)."""
-
 from __future__ import annotations
 
 from decimal import Decimal

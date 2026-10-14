@@ -1,5 +1,3 @@
-"""SQLAlchemy-модели таблиц payments и outbox."""
-
 from __future__ import annotations
 
 import uuid

@@ -1,10 +1,7 @@
-"""Создание таблиц payments и outbox.
-
-Revision ID: 20261014_0001
-Revises:
-Create Date: 2026-10-14 19:00:00.000000
-
-"""
+# Создание таблиц payments и outbox.
+# Revision ID: 20261014_0001
+# Revises:
+# Create Date: 2026-10-14 19:00:00.000000
 
 from __future__ import annotations
 

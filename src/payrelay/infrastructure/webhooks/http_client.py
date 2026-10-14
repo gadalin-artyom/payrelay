@@ -1,5 +1,3 @@
-"""Асинхронный HTTP-клиент webhook с SSRF-фильтрацией и стабильным event id."""
-
 from __future__ import annotations
 
 import ipaddress

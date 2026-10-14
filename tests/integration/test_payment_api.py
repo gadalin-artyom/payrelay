@@ -1,5 +1,3 @@
-"""Интеграционные тесты Payment API + атомарность + конкурентная идемпотентность."""
-
 from __future__ import annotations
 
 import asyncio

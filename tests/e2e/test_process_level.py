@@ -1,8 +1,3 @@
-"""Process-level E2E: реальные api / outbox-publisher / consumer + webhook receiver.
-
-Сценарии E2E-01…E2E-05. Только postgres-test / rabbitmq-test.
-"""
-
 from __future__ import annotations
 
 import asyncio

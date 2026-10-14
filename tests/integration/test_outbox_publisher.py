@@ -1,9 +1,3 @@
-"""Integration-тесты Outbox Publisher + RabbitMQ topology (этап 003).
-
-I06 (отсутствие второй бизнес-операции) полностью не проверяется —
-consumer появится на этапе 004; здесь лишь дубликат event_id на уровне AMQP.
-"""
-
 from __future__ import annotations
 
 import asyncio

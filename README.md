@@ -45,6 +45,7 @@ Alembic **не** выполняется приложением при старт
 - `api` — `POST`/`GET` платежей и `/health/live` (не ждёт RabbitMQ на каждый запрос).
 - `outbox-publisher` — claim Outbox → publish confirm → `published_at`.
 - `consumer` — эмуляция шлюза (≈90/10, задержка 2–5 с), terminal status, webhook HTTP.
+- `docker-socket-proxy` / `dozzle` — локальный UI логов (read-only Docker API).
 - Webhook: до **3** логических попыток; после HTTP-сбоя #1/#2 — Outbox
   `payment.webhook_retry` с `available_at = now()+2s/4s` (без sleep в handler).
   После 3-й неудачи — `webhook_delivery_status=exhausted` и `reject` → `payments.dlq`.
@@ -80,12 +81,18 @@ curl -fsS -H "X-API-Key: $API_KEY" \
   http://127.0.0.1:8000/api/v1/payments/<payment_id>
 ```
 
-Типичные ошибки: **401** (нет/неверный `X-API-Key`), **404** (неизвестный UUID),
-**409** (тот же `Idempotency-Key`, другое тело), **422** (валидация / нет ключа идемпотентности).
+Типичные ошибки (сообщения на русском, контракт полей без изменений):
+
+- **401** — `Неверный или отсутствующий API-ключ.`
+- **404** — `Платёж не найден.`
+- **409** — `Этот Idempotency-Key уже использован для другого платежа.`
+- **422** — список `{loc, msg, type}` (нет `Idempotency-Key`, сумма, валюта, UUID, …).
 
 Swagger `/docs` доступен только при `ENABLE_DOCS=true` и `APP_ENV!=production`
-(по умолчанию в `.env.example` включён для локальной разработки). Все публичные
-маршруты, включая health, требуют `X-API-Key`.
+(по умолчанию в `.env.example` включён для локальной разработки). В UI нажмите
+**Authorize** и введите `X-API-Key` из `.env`; для POST также укажите
+`Idempotency-Key` (генерирует клиент). Все публичные маршруты, включая health,
+требуют `X-API-Key`.
 
 ## Поведение симулятора и webhook
 
@@ -98,11 +105,15 @@ Swagger `/docs` доступен только при `ENABLE_DOCS=true` и `APP_
 - `system_attempt` — не глобальный durable counter; legacy recovery может начать
   retry сразу. DLQ — диагностика, не автоматический business replay.
 
-## RabbitMQ (локальный просмотр)
+## Мониторинг (локально)
 
-Management UI (только dev-брокер): http://127.0.0.1:15672  
-Учётка из `.env` (`RABBITMQ_DEFAULT_USER` / `RABBITMQ_DEFAULT_PASS`) — не публикуйте
-реальные секреты.
+### RabbitMQ Management UI
+
+Адрес: http://127.0.0.1:15672 (порт `RABBITMQ_MANAGEMENT_PORT`, bind только loopback).  
+Учётка из `.env` (`RABBITMQ_DEFAULT_USER` / `RABBITMQ_DEFAULT_PASS`) — placeholder
+для dev; не публикуйте реальные секреты и не открывайте порт наружу.
+Отдельный пользователь с тегом `monitoring` не заведён: для локального просмотра
+достаточно dev-аккаунта Compose.
 
 Topology после старта `outbox-publisher`:
 
@@ -111,8 +122,21 @@ Topology после старта `outbox-publisher`:
 - retry queues `payments.retry.2` / `payments.retry.3` (TTL 2s/4s)
 - DLQ `payments.dlq`
 
+В UI смотрите Ready / Unacked / Consumers / connections. Это состояние брокера,
+а не история отдельной бизнес-операции (Flower не используется — стек не Celery).
+
 Безопасный просмотр: Queues → Get messages (без global purge). В DLQ ожидайте
 `x-death` с `reason=rejected` (или `expired` для TTL-маршрутов).
+
+### Workers UI (Dozzle)
+
+Поднимается вместе с основным стеком (`docker compose -f infra/compose.yaml up -d --build`).
+
+UI: http://127.0.0.1:9999 (`DOZZLE_PORT`). Dozzle ходит в Docker API через
+`tecnativa/docker-socket-proxy` (read-only: containers/events/info; `POST`/exec/actions
+выключены; порт 2375 наружу не публикуется). Фильтр имён `payrelay*`.
+Restart/stop/shell из UI отключены.
+
 
 ## Проверки качества
 
@@ -154,11 +178,3 @@ docker compose -f infra/compose.yaml --profile test down
 # docker volume rm payrelay_postgres_test_data payrelay_rabbitmq_test_data
 ```
 
-## Ограничения безопасности (честно)
-
-- Production: `WEBHOOK_ALLOW_PRIVATE_URLS=false`; запрет loopback/RFC1918/link-local/metadata,
-  DNS precheck, запрет redirect, timeout. **DNS precheck ≠ полная защита от DNS rebinding**;
-  для production нужен network-level egress / pinning назначения.
-- В test profile private URL (localhost receiver) разрешены явно флагом окружения.
-- Секреты только в env; `.env` / `.ai` / `.cursor` / `.serena` / `.repomix` / `AGENTS.md`
-  / `SKILLS.md` не отслеживаются Git.

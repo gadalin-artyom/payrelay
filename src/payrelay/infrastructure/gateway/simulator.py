@@ -1,16 +1,20 @@
-"""Детерминированный симулятор платёжного шлюза (90/10, задержка 2–5 с)."""
-
 from __future__ import annotations
 
 import hashlib
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Final, Protocol
 
 from payrelay.domain.enums import PaymentStatus
 
 SleepFunc = Callable[[float], Awaitable[None]]
+
+_OUTCOME_BUCKETS: Final[int] = 10
+_SUCCESS_BUCKET_LIMIT: Final[int] = 9
+_DEFAULT_MIN_DELAY_SECONDS: Final[float] = 2.0
+_DEFAULT_MAX_DELAY_SECONDS: Final[float] = 5.0
+_DELAY_FRACTION_MODULO: Final[int] = 1_000_000
 
 
 class PaymentGateway(Protocol):
@@ -51,7 +55,7 @@ def deterministic_outcome(payment_id: uuid.UUID) -> PaymentStatus:
     """
     digest = hashlib.sha256(payment_id.bytes).digest()
     value = int.from_bytes(digest[:8], "big", signed=False)
-    if value % 10 < 9:
+    if value % _OUTCOME_BUCKETS < _SUCCESS_BUCKET_LIMIT:
         return PaymentStatus.SUCCEEDED
     return PaymentStatus.FAILED
 
@@ -59,8 +63,8 @@ def deterministic_outcome(payment_id: uuid.UUID) -> PaymentStatus:
 def deterministic_delay_seconds(
     payment_id: uuid.UUID,
     *,
-    min_seconds: float = 2.0,
-    max_seconds: float = 5.0,
+    min_seconds: float = _DEFAULT_MIN_DELAY_SECONDS,
+    max_seconds: float = _DEFAULT_MAX_DELAY_SECONDS,
 ) -> float:
     """Вычислить стабильную задержку в ``[min_seconds, max_seconds]``.
 
@@ -84,7 +88,7 @@ def deterministic_delay_seconds(
     if span == 0:
         return float(min_seconds)
     # Равномерное отображение в [0, 1) без float-сумм денег.
-    fraction = (value % 1_000_000) / 1_000_000.0
+    fraction = (value % _DELAY_FRACTION_MODULO) / float(_DELAY_FRACTION_MODULO)
     return float(min_seconds + span * fraction)
 
 
@@ -95,8 +99,8 @@ class GatewaySimulator:
         self,
         *,
         sleep: SleepFunc,
-        min_delay_seconds: float = 2.0,
-        max_delay_seconds: float = 5.0,
+        min_delay_seconds: float = _DEFAULT_MIN_DELAY_SECONDS,
+        max_delay_seconds: float = _DEFAULT_MAX_DELAY_SECONDS,
         forced_outcome: PaymentStatus | None = None,
     ) -> None:
         """Инициализировать симулятор.

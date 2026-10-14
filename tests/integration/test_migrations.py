@@ -1,5 +1,3 @@
-"""I01: проверка Alembic-миграций на чистой test DB."""
-
 from __future__ import annotations
 
 import os

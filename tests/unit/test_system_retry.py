@@ -1,5 +1,3 @@
-"""U15: unit-тесты system retry publish и consumer helpers."""
-
 from __future__ import annotations
 
 import uuid

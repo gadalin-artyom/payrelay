@@ -1,5 +1,3 @@
-"""Эмулятор платёжного шлюза."""
-
 from payrelay.infrastructure.gateway.simulator import (
     GatewayOutcome,
     GatewaySimulator,

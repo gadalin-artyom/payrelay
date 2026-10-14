@@ -1,5 +1,3 @@
-"""Unit-тесты технического маршрута /health/live."""
-
 from __future__ import annotations
 
 import pytest

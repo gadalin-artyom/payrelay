@@ -1,5 +1,3 @@
-"""Обработка платежа: gateway simulation + webhook retry (application-слой)."""
-
 from __future__ import annotations
 
 import logging

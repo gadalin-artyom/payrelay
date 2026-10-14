@@ -1,5 +1,3 @@
-"""Доменные перечисления статусов и валют."""
-
 from __future__ import annotations
 
 from enum import StrEnum

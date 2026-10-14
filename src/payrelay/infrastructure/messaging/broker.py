@@ -1,5 +1,3 @@
-"""Фабрика RabbitBroker с publisher confirms."""
-
 from __future__ import annotations
 
 from faststream.rabbit import Channel, RabbitBroker

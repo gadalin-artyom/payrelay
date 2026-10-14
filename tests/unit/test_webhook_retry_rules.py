@@ -1,5 +1,3 @@
-"""Unit-тесты чистых правил webhook/system retry."""
-
 from __future__ import annotations
 
 import pytest

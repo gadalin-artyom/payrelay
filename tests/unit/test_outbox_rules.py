@@ -1,5 +1,3 @@
-"""Unit-тесты правил доступности Outbox и publish-backoff."""
-
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta

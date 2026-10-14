@@ -1,5 +1,3 @@
-"""Фикстуры process-level E2E (только postgres-test / rabbitmq-test)."""
-
 from __future__ import annotations
 
 import os

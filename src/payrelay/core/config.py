@@ -1,5 +1,3 @@
-"""Конфигурация приложения из переменных окружения."""
-
 from functools import lru_cache
 from typing import Literal, Self
 

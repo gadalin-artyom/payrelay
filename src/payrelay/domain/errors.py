@@ -1,5 +1,3 @@
-"""Доменные ошибки PayRelay."""
-
 from __future__ import annotations
 
 

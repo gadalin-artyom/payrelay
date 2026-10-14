@@ -1,5 +1,3 @@
-"""Публикация Outbox-событий в RabbitMQ с broker confirms."""
-
 from __future__ import annotations
 
 import uuid

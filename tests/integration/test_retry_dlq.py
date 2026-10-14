@@ -1,9 +1,3 @@
-"""Integration: webhook retry, recovery, system retry, DLQ (этап 005).
-
-I09/I10/I14, legacy recovery, crash-after-commit, TTL/DLQ topology.
-Только postgres-test / rabbitmq-test.
-"""
-
 from __future__ import annotations
 
 import asyncio

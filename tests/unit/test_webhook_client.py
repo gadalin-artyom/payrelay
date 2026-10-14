@@ -1,5 +1,3 @@
-"""U12/U16: webhook payload, стабильный event id, SSRF policy."""
-
 from __future__ import annotations
 
 import ipaddress

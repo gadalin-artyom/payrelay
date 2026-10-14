@@ -1,5 +1,3 @@
-"""Репозитории платежей и Outbox."""
-
 from __future__ import annotations
 
 import json

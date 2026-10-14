@@ -1,9 +1,3 @@
-"""Имена и объявление топологии RabbitMQ для PayRelay.
-
-Единый источник имён exchanges/queues/routing keys для publisher
-и будущего consumer (этапы 004–005).
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass

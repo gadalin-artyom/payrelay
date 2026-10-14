@@ -1,5 +1,3 @@
-"""Фабрика async-движка и сессий SQLAlchemy."""
-
 from __future__ import annotations
 
 from collections.abc import AsyncIterator

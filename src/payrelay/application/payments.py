@@ -1,5 +1,3 @@
-"""Сценарии создания и чтения платежей с идемпотентностью."""
-
 from __future__ import annotations
 
 import uuid

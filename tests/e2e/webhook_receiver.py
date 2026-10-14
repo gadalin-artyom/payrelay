@@ -1,9 +1,3 @@
-"""Минимальный test-only HTTP webhook receiver для process-level E2E.
-
-Не является production-компонентом: только журнал безопасных метаданных
-и управляемые ответы (200 / 500).
-"""
-
 from __future__ import annotations
 
 import threading

@@ -1,5 +1,3 @@
-"""Unit-тесты mapping Outbox → AMQP и проверки broker confirm."""
-
 from __future__ import annotations
 
 import uuid

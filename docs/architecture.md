@@ -27,15 +27,22 @@ Client --HTTP--> api (FastAPI) --- PostgreSQL (payments + outbox)
                                  +-----> merchant webhook URL
 ```
 
-Compose: `postgres`, `rabbitmq`, `api`, `consumer`, `outbox-publisher`.
+Compose: `postgres`, `rabbitmq`, `api`, `consumer`, `outbox-publisher`,
+`docker-socket-proxy`, `dozzle` (единый `infra/compose.yaml`).
 Тестовый profile `test`: **отдельные** `postgres-test`, `rabbitmq-test` и
-`tests` (test-runner с доступом по Docker-сети) с отдельными секретами и volume. RabbitMQ management UI только для локальной разработки.
+`tests` (test-runner с доступом по Docker-сети) с отдельными секретами и volume.
+RabbitMQ Management UI (образ `*-management`) публикуется только на
+`127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-15672}` — локальная разработка, не prod.
+Dozzle + docker-socket-proxy (read-only) для логов `api` / `consumer` /
+`outbox-publisher` без монтирования `docker.sock` в UI и без админ-действий;
+UI на `127.0.0.1:${DOZZLE_PORT:-9999}`.
 
 ## 3. Модули и запуск
 
 ```text
 src/payrelay/
-  api/{app.py,routers/payments.py,dependencies.py,schemas.py}
+  api/{app.py,routers/payments.py,dependencies.py,schemas.py,
+       exception_handlers.py,errors.py,messages.py,constants.py}
   application/{payments.py,process_payment.py,outbox_dispatcher.py}
   domain/{enums.py,contracts.py,errors.py}
   infrastructure/{db/{models.py,session.py,repositories.py},

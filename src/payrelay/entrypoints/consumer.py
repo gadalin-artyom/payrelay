@@ -1,5 +1,3 @@
-"""Точка входа роли consumer (FastStream + gateway + webhook)."""
-
 from __future__ import annotations
 
 import asyncio
