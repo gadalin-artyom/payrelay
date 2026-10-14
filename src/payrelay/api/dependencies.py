@@ -1,12 +1,14 @@
-"""Зависимости FastAPI: аутентификация и доступ к настройкам."""
+"""Зависимости FastAPI: аутентификация, настройки и сессия БД."""
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from payrelay.core.config import Settings, get_settings
 
@@ -45,3 +47,24 @@ async def require_api_key(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized",
         )
+
+
+async def get_db_session(request: Request) -> AsyncIterator[AsyncSession]:
+    """Выдать AsyncSession на время HTTP-запроса.
+
+    Args:
+        request: Текущий FastAPI Request (берёт session_factory из app.state).
+
+    Yields:
+        Сессия SQLAlchemy.
+
+    Raises:
+        RuntimeError: если приложение запущено без инициализации БД.
+    """
+    session_factory = getattr(request.app.state, "session_factory", None)
+    if session_factory is None:
+        msg = "Database session factory is not initialized"
+        raise RuntimeError(msg)
+    factory: async_sessionmaker[AsyncSession] = session_factory
+    async with factory() as session:
+        yield session

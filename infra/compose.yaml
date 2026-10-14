@@ -2,8 +2,8 @@
 # Обычный профиль: postgres, rabbitmq, api, consumer, outbox-publisher.
 # Profile `test`: postgres-test, rabbitmq-test, tests (порты наружу не публикуются).
 #
-# Миграции Alembic (`alembic upgrade head`) появятся на этапе 002;
-# до этого сервисы не выполняют upgrade.
+# Миграции: `uv run alembic upgrade head` (или через сервис tests / api).
+# Приложение само upgrade не выполняет — схема готовится отдельно.
 
 name: payrelay
 
@@ -169,7 +169,12 @@ services:
         condition: service_healthy
       rabbitmq-test:
         condition: service_healthy
-    # По умолчанию unit; integration — после этапа 002+.
+    # По умолчанию unit. Integration:
+    #   docker compose -f infra/compose.yaml --profile test run --rm tests \
+    #     uv run pytest -m integration
+    # Миграции на test DB (явный безопасный шаг, также делается фикстурой suite):
+    #   docker compose -f infra/compose.yaml --profile test run --rm tests \
+    #     uv run alembic upgrade head
     command: ["uv", "run", "pytest", "-m", "unit"]
 
 volumes:

@@ -45,5 +45,3 @@ logs/
 
 # Docker/local transient
 *.pid
-
-/docs/

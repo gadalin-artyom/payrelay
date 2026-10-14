@@ -18,6 +18,8 @@ COPY --from=ghcr.io/astral-sh/uv:0.12.5 /uv /usr/local/bin/uv
 
 COPY pyproject.toml README.md uv.lock ./
 COPY src ./src
+COPY alembic.ini ./
+COPY alembic ./alembic
 
 FROM base AS runtime
 
