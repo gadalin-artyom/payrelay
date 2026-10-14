@@ -414,12 +414,12 @@ async def test_i13_crash_after_http_2xx_before_delivered(
 
 
 @pytest.mark.asyncio
-async def test_http_500_keeps_terminal_pending_attempt_one(
+async def test_http_500_schedules_retry2_outbox(
     api_client: tuple[AsyncClient, str],
     session_factory: async_sessionmaker[AsyncSession],
     integration_settings: Settings,
 ) -> None:
-    """HTTP 500: terminal неизменен, webhook pending, attempts=1 (до stage 005)."""
+    """HTTP 500: terminal неизменен, pending, attempts=1, Outbox retry2 (+~2s)."""
     client, api_key = api_client
     payment_id = await _create_payment(client, api_key, suffix="http500")
     webhook = _webhook_client(status_code=500)
@@ -438,11 +438,33 @@ async def test_http_500_keeps_terminal_pending_attempt_one(
         event_id=uuid.uuid4(),
     )
     assert result.outcome is ProcessOutcome.ACK
-    assert result.detail == "webhook_failed_deferred_stage_005"
+    assert result.detail == "webhook_failed_retry_scheduled"
     row = await _get_payment_row(session_factory, payment_id)
     assert row["status"] == PaymentStatus.SUCCEEDED.value
     assert row["webhook_delivery_status"] == WebhookDeliveryStatus.PENDING.value
     assert row["webhook_attempts"] == 1
+    async with session_factory() as session:
+        outbox = (
+            (
+                await session.execute(
+                    text(
+                        """
+                        SELECT delivery_attempt, event_type,
+                               EXTRACT(EPOCH FROM (available_at - now())) AS delay_s
+                        FROM outbox
+                        WHERE aggregate_id = :payment_id
+                          AND event_type = 'payment.webhook_retry'
+                          AND delivery_attempt = 2
+                        """
+                    ),
+                    {"payment_id": payment_id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert outbox["delivery_attempt"] == 2
+    assert 1.5 <= float(outbox["delay_s"]) <= 2.5
     await webhook.aclose()
 
 

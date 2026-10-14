@@ -48,6 +48,10 @@ tests/{unit,integration,e2e,conftest.py}
 infra/compose.yaml
 ```
 
+Process-level E2E (`tests/e2e`): поднимает реальные entrypoints subprocess'ами внутри
+Compose service `tests` и локальный HTTP webhook receiver; не добавляет постоянный
+production-сервис.
+
 Важнее отсутствие циклических импортов и понятные границы, чем формальное число слоёв.
 **Один handler** в consumer оркестрирует и бизнес-операцию, и доставку webhook.
 
@@ -138,8 +142,10 @@ infra/compose.yaml
 - `X-API-Key` сверять constant-time; секреты через env, не логировать.
 - HTTPX timeout/limit concurrency, redirects выключены.
 - В production запрещены loopback, RFC1918, link-local, cloud metadata адреса;
-  DNS re-resolution/rebinding следует учитывать на уровне выбранного HTTP transport.
-- В test profile можно разрешить webhook на `webhook-receiver` в Docker сети.
+  DNS precheck **не равен** полной защите от DNS rebinding — для production нужен
+  network-level egress / pinning назначения.
+- В test/E2E profile можно разрешить private URL (`WEBHOOK_ALLOW_PRIVATE_URLS=true`)
+  для localhost webhook receiver; production policy этим не ослабляется.
 - Ошибки и логи не должны содержать секреты или чувствительные metadata целиком.
 
 ## 9. Наблюдаемость и критерии

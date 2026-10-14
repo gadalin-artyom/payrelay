@@ -136,12 +136,42 @@ class OutboxDispatcher:
             )
         return True
 
+    async def recover_pending_webhooks(self) -> int:
+        """Восстановить legacy pending webhook без Outbox retry (этап 004).
+
+        Создаёт недостающие ``payment.webhook_retry`` для terminal+pending
+        с ``webhook_attempts`` 1 или 2 при отсутствии активного lease.
+        Идемпотентно за счёт уникального ключа Outbox.
+
+        Returns:
+            Число вставленных Outbox-строк.
+        """
+        if self._stopping:
+            return 0
+        async with self.session_factory() as session:
+            async with session.begin():
+                repo = OutboxRepository(session)
+                inserted = await repo.recover_pending_webhook_retries(
+                    batch_size=self.settings.webhook_recovery_batch_size,
+                )
+        if inserted:
+            logger.info(
+                "Recovered pending webhook retries",
+                extra={"inserted": inserted},
+            )
+        return inserted
+
     async def run_tick(self) -> int:
-        """Обработать до ``outbox_batch_size`` событий подряд.
+        """Recovery pending webhook + публикация до ``outbox_batch_size`` событий.
 
         Returns:
             Число обработанных (захваченных) записей за тик.
         """
+        try:
+            await self.recover_pending_webhooks()
+        except Exception:
+            logger.exception("Webhook pending recovery tick failed")
+
         processed = 0
         limit = self.settings.outbox_batch_size
         while processed < limit and not self._stopping:

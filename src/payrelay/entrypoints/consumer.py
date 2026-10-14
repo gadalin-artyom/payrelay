@@ -107,7 +107,7 @@ async def _run_consumer(settings: Settings) -> None:
 
     try:
         broker = await _connect_broker_with_backoff(settings, stop_event)
-        register_payments_consumer(broker, service)
+        register_payments_consumer(broker, service, settings=settings)
         await broker.start()
         logger.info("Consumer started; waiting for payments.new messages")
         await stop_event.wait()

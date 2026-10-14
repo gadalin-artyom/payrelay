@@ -172,6 +172,9 @@ services:
     # По умолчанию unit. Integration:
     #   docker compose -f infra/compose.yaml --profile test run --rm tests \
     #     uv run pytest -m integration
+    # Process-level E2E (реальные entrypoints + localhost webhook receiver):
+    #   docker compose -f infra/compose.yaml --profile test run --rm tests \
+    #     uv run pytest -m e2e
     # Миграции на test DB (явный безопасный шаг, также делается фикстурой suite):
     #   docker compose -f infra/compose.yaml --profile test run --rm tests \
     #     uv run alembic upgrade head

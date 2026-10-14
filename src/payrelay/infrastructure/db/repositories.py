@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -397,6 +398,110 @@ class PaymentRepository:
         )
         return result.scalar_one_or_none() is not None
 
+    async def record_webhook_failure_and_schedule_retry(
+        self,
+        *,
+        payment_id: uuid.UUID,
+        lease_token: datetime,
+        failed_attempt: int,
+        delay_seconds: float,
+        outbox_repo: OutboxRepository,
+    ) -> bool:
+        """Зафиксировать HTTP-неуспех и создать retry Outbox в одной TX.
+
+        Ожидает, что ``webhook_attempts`` уже равен ``failed_attempt``
+        (после ``mark_webhook_attempt_started``). ``payment.status`` не меняется.
+        Insert retry идемпотентен через ``ON CONFLICT DO NOTHING``.
+
+        Args:
+            payment_id: UUID платежа.
+            lease_token: Owner token lease.
+            failed_attempt: Номер завершившейся HTTP-попытки (1 или 2).
+            delay_seconds: Задержка ``available_at`` относительно ``now()`` БД.
+            outbox_repo: Репозиторий Outbox той же сессии.
+
+        Returns:
+            ``True``, если CAS платежа успешен (retry вставлен или уже был).
+        """
+        next_attempt = failed_attempt + 1
+        stmt = text(
+            """
+            UPDATE payments
+            SET processing_lease_until = NULL
+            WHERE id = :payment_id
+              AND processing_lease_until = :lease_token
+              AND webhook_delivery_status = :webhook_pending
+              AND status IN (:succeeded, :failed)
+              AND webhook_attempts = :failed_attempt
+            RETURNING id
+            """
+        )
+        result = await self._session.execute(
+            stmt,
+            {
+                "payment_id": payment_id,
+                "lease_token": lease_token,
+                "webhook_pending": WebhookDeliveryStatus.PENDING.value,
+                "succeeded": PaymentStatus.SUCCEEDED.value,
+                "failed": PaymentStatus.FAILED.value,
+                "failed_attempt": int(failed_attempt),
+            },
+        )
+        if result.scalar_one_or_none() is None:
+            return False
+        await outbox_repo.insert_webhook_retry_if_absent(
+            payment_id=payment_id,
+            delivery_attempt=next_attempt,
+            delay_seconds=delay_seconds,
+        )
+        return True
+
+    async def mark_webhook_exhausted(
+        self,
+        *,
+        payment_id: uuid.UUID,
+        lease_token: datetime,
+        failed_attempt: int = 3,
+    ) -> bool:
+        """Пометить webhook ``exhausted`` после 3-й HTTP-неудачи (CAS).
+
+        Args:
+            payment_id: UUID платежа.
+            lease_token: Owner token.
+            failed_attempt: Ожидаемый номер попытки (обычно 3).
+
+        Returns:
+            ``True``, если обновление выполнено владельцем.
+        """
+        stmt = text(
+            """
+            UPDATE payments
+            SET
+                webhook_delivery_status = :exhausted,
+                webhook_attempts = :failed_attempt,
+                processing_lease_until = NULL
+            WHERE id = :payment_id
+              AND processing_lease_until = :lease_token
+              AND webhook_delivery_status = :webhook_pending
+              AND status IN (:succeeded, :failed)
+              AND webhook_attempts = :failed_attempt
+            RETURNING id
+            """
+        )
+        result = await self._session.execute(
+            stmt,
+            {
+                "payment_id": payment_id,
+                "lease_token": lease_token,
+                "exhausted": WebhookDeliveryStatus.EXHAUSTED.value,
+                "webhook_pending": WebhookDeliveryStatus.PENDING.value,
+                "succeeded": PaymentStatus.SUCCEEDED.value,
+                "failed": PaymentStatus.FAILED.value,
+                "failed_attempt": int(failed_attempt),
+            },
+        )
+        return result.scalar_one_or_none() is not None
+
 
 class OutboxRepository:
     """Доступ к таблице outbox."""
@@ -446,6 +551,221 @@ class OutboxRepository:
         self._session.add(row)
         await self._session.flush()
         return row
+
+    async def insert_webhook_retry_if_absent(
+        self,
+        *,
+        payment_id: uuid.UUID,
+        delivery_attempt: int,
+        delay_seconds: float,
+    ) -> uuid.UUID | None:
+        """Вставить ``payment.webhook_retry`` с ``available_at = now() + delay``.
+
+        Идемпотентно: уникальный ключ
+        ``(aggregate_id, event_type, delivery_attempt)`` + ``ON CONFLICT DO NOTHING``.
+        Время берётся из часов PostgreSQL.
+
+        Args:
+            payment_id: UUID платежа (aggregate_id).
+            delivery_attempt: Номер попытки (2 или 3).
+            delay_seconds: Задержка относительно ``now()`` БД (0 для recovery).
+
+        Returns:
+            UUID новой строки либо ``None``, если конфликт (уже существует).
+        """
+        event_id = uuid.uuid4()
+        event_type = OutboxEventType.PAYMENT_WEBHOOK_RETRY.value
+        payload: dict[str, Any] = {
+            "schema_version": 1,
+            "event_id": str(event_id),
+            "payment_id": str(payment_id),
+            "event_type": event_type,
+            "attempt": int(delivery_attempt),
+        }
+        stmt = text(
+            """
+            INSERT INTO outbox (
+                id,
+                aggregate_id,
+                event_type,
+                payload,
+                delivery_attempt,
+                available_at,
+                published_at,
+                claimed_until,
+                attempts,
+                created_at
+            )
+            VALUES (
+                :id,
+                :aggregate_id,
+                :event_type,
+                CAST(:payload AS jsonb),
+                :delivery_attempt,
+                now() + make_interval(secs => :delay_seconds),
+                NULL,
+                NULL,
+                0,
+                now()
+            )
+            ON CONFLICT ON CONSTRAINT uq_outbox_aggregate_event_attempt
+            DO NOTHING
+            RETURNING id
+            """
+        )
+        result = await self._session.execute(
+            stmt,
+            {
+                "id": event_id,
+                "aggregate_id": payment_id,
+                "event_type": event_type,
+                "payload": json.dumps(payload),
+                "delivery_attempt": int(delivery_attempt),
+                "delay_seconds": float(delay_seconds),
+            },
+        )
+        return result.scalar_one_or_none()
+
+    async def has_delivery_attempt(
+        self,
+        *,
+        payment_id: uuid.UUID,
+        event_type: str,
+        delivery_attempt: int,
+    ) -> bool:
+        """Проверить наличие Outbox-события с данным delivery_attempt.
+
+        Args:
+            payment_id: UUID платежа.
+            event_type: Тип события Outbox.
+            delivery_attempt: Номер попытки доставки.
+
+        Returns:
+            ``True``, если строка существует.
+        """
+        stmt = text(
+            """
+            SELECT 1
+            FROM outbox
+            WHERE aggregate_id = :payment_id
+              AND event_type = :event_type
+              AND delivery_attempt = :delivery_attempt
+            LIMIT 1
+            """
+        )
+        result = await self._session.execute(
+            stmt,
+            {
+                "payment_id": payment_id,
+                "event_type": event_type,
+                "delivery_attempt": int(delivery_attempt),
+            },
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def recover_pending_webhook_retries(
+        self,
+        *,
+        batch_size: int,
+    ) -> int:
+        """Создать недостающие ``payment.webhook_retry`` для legacy pending.
+
+        Выбирает terminal + ``webhook_delivery_status=pending`` +
+        ``webhook_attempts IN (1,2)`` без активного lease и без Outbox на
+        следующую попытку. ``available_at = now()`` (немедленная публикация).
+        ``pending`` с ``attempts=0`` не трогает.
+
+        Args:
+            batch_size: Максимум платежей за один вызов.
+
+        Returns:
+            Число успешно вставленных Outbox-строк.
+        """
+        event_type = OutboxEventType.PAYMENT_WEBHOOK_RETRY.value
+        # FOR UPDATE SKIP LOCKED на payments; INSERT ... ON CONFLICT DO NOTHING.
+        stmt = text(
+            """
+            WITH candidates AS (
+                SELECT
+                    p.id AS payment_id,
+                    p.webhook_attempts AS webhook_attempts
+                FROM payments AS p
+                WHERE p.status IN (:succeeded, :failed)
+                  AND p.webhook_delivery_status = :webhook_pending
+                  AND p.webhook_attempts IN (1, 2)
+                  AND (
+                        p.processing_lease_until IS NULL
+                        OR p.processing_lease_until <= now()
+                      )
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM outbox AS o
+                        WHERE o.aggregate_id = p.id
+                          AND o.event_type = :event_type
+                          AND o.delivery_attempt = p.webhook_attempts + 1
+                      )
+                ORDER BY p.created_at, p.id
+                FOR UPDATE OF p SKIP LOCKED
+                LIMIT :batch_size
+            ),
+            prepared AS (
+                SELECT
+                    gen_random_uuid() AS id,
+                    c.payment_id AS aggregate_id,
+                    :event_type AS event_type,
+                    c.webhook_attempts + 1 AS delivery_attempt
+                FROM candidates AS c
+            ),
+            inserted AS (
+                INSERT INTO outbox (
+                    id,
+                    aggregate_id,
+                    event_type,
+                    payload,
+                    delivery_attempt,
+                    available_at,
+                    published_at,
+                    claimed_until,
+                    attempts,
+                    created_at
+                )
+                SELECT
+                    p.id,
+                    p.aggregate_id,
+                    p.event_type,
+                    jsonb_build_object(
+                        'schema_version', 1,
+                        'event_id', p.id::text,
+                        'payment_id', p.aggregate_id::text,
+                        'event_type', p.event_type,
+                        'attempt', p.delivery_attempt
+                    ),
+                    p.delivery_attempt,
+                    now(),
+                    NULL,
+                    NULL,
+                    0,
+                    now()
+                FROM prepared AS p
+                ON CONFLICT ON CONSTRAINT uq_outbox_aggregate_event_attempt
+                DO NOTHING
+                RETURNING id
+            )
+            SELECT count(*)::int AS inserted_count FROM inserted
+            """
+        )
+        result = await self._session.execute(
+            stmt,
+            {
+                "succeeded": PaymentStatus.SUCCEEDED.value,
+                "failed": PaymentStatus.FAILED.value,
+                "webhook_pending": WebhookDeliveryStatus.PENDING.value,
+                "event_type": event_type,
+                "batch_size": int(batch_size),
+            },
+        )
+        count: int | None = result.scalar_one()
+        return int(count or 0)
 
     async def claim_next(
         self,

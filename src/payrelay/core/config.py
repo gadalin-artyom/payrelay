@@ -66,6 +66,21 @@ class Settings(BaseSettings):
         gt=0,
         description="Таймаут TCP connect для webhook HTTP.",
     )
+    webhook_retry_delay_2_seconds: float = Field(
+        default=2.0,
+        gt=0,
+        description="Задержка Outbox перед 2-й попыткой webhook (сек).",
+    )
+    webhook_retry_delay_4_seconds: float = Field(
+        default=4.0,
+        gt=0,
+        description="Задержка Outbox перед 3-й попыткой webhook (сек).",
+    )
+    webhook_recovery_batch_size: int = Field(
+        default=50,
+        ge=1,
+        description="Максимум платежей за один tick recovery pending webhook.",
+    )
 
     outbox_poll_interval_seconds: float = Field(
         default=0.5,
@@ -186,7 +201,29 @@ class Settings(BaseSettings):
                 "(APP_ENV=production)"
             )
             raise ValueError(msg)
+        if self.webhook_retry_delay_4_seconds < self.webhook_retry_delay_2_seconds:
+            msg = (
+                "WEBHOOK_RETRY_DELAY_4_SECONDS must be >= WEBHOOK_RETRY_DELAY_2_SECONDS"
+            )
+            raise ValueError(msg)
         return self
+
+    def webhook_retry_delay_for_failed_attempt(
+        self, failed_attempt: int
+    ) -> float | None:
+        """Вернуть задержку Outbox для retry после неуспешной HTTP-попытки.
+
+        Args:
+            failed_attempt: Номер завершившейся попытки (1 или 2).
+
+        Returns:
+            Секунды задержки либо ``None``, если следующей попытки нет.
+        """
+        if failed_attempt == 1:
+            return float(self.webhook_retry_delay_2_seconds)
+        if failed_attempt == 2:
+            return float(self.webhook_retry_delay_4_seconds)
+        return None
 
     @property
     def is_production(self) -> bool:

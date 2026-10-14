@@ -33,3 +33,4 @@ class OutboxEventType(StrEnum):
     """Типы событий Outbox, используемые в v1."""
 
     PAYMENT_CREATED = "payment.created"
+    PAYMENT_WEBHOOK_RETRY = "payment.webhook_retry"

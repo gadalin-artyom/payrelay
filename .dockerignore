@@ -25,5 +25,3 @@ repomix-output.*
 *.md
 !README.md
 docs
-# e2e появятся на поздних этапах; integration нужен с этапа 002.
-tests/e2e

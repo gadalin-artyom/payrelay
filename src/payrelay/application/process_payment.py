@@ -1,4 +1,4 @@
-"""Обработка платежа: gateway simulation + webhook (application-слой)."""
+"""Обработка платежа: gateway simulation + webhook retry (application-слой)."""
 
 from __future__ import annotations
 
@@ -14,9 +14,14 @@ from typing import Protocol
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from payrelay.core.config import Settings
-from payrelay.domain.enums import PaymentStatus, WebhookDeliveryStatus
+from payrelay.domain.enums import OutboxEventType, PaymentStatus, WebhookDeliveryStatus
+from payrelay.domain.webhook_retry_rules import (
+    MAX_WEBHOOK_ATTEMPTS,
+    is_valid_event_attempt,
+    next_webhook_attempt,
+)
 from payrelay.infrastructure.db.models import PaymentModel
-from payrelay.infrastructure.db.repositories import PaymentRepository
+from payrelay.infrastructure.db.repositories import OutboxRepository, PaymentRepository
 from payrelay.infrastructure.gateway.simulator import PaymentGateway
 from payrelay.infrastructure.webhooks.http_client import (
     WebhookHttpClient,
@@ -45,6 +50,7 @@ class _LeaseAcquireKind(StrEnum):
     ALREADY_DELIVERED = "already_delivered"
     BUSY = "busy"
     NOT_FOUND = "not_found"
+    EXHAUSTED = "exhausted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +98,7 @@ class ProcessPaymentService:
     sleep: SleepFunc
     _on_after_terminal_commit: AsyncHook | None = field(default=None, repr=False)
     _on_after_webhook_http_ok: AsyncHook | None = field(default=None, repr=False)
+    _on_after_webhook_failure_commit: AsyncHook | None = field(default=None, repr=False)
 
     def set_after_terminal_commit_hook(self, hook: AsyncHook | None) -> None:
         """Hook после commit terminal (для crash-тестов I12).
@@ -109,6 +116,14 @@ class ProcessPaymentService:
         """
         self._on_after_webhook_http_ok = hook
 
+    def set_after_webhook_failure_commit_hook(self, hook: AsyncHook | None) -> None:
+        """Hook после commit failure+retry Outbox до ACK (crash-тесты).
+
+        Args:
+            hook: Async callback или ``None``.
+        """
+        self._on_after_webhook_failure_commit = hook
+
     async def process_payment_created(
         self,
         *,
@@ -116,11 +131,40 @@ class ProcessPaymentService:
         event_id: uuid.UUID,
         stop: StopSignal | None = None,
     ) -> ProcessResult:
-        """Обработать событие ``payment.created``.
+        """Обработать событие ``payment.created`` (attempt=1).
 
         Args:
             payment_id: UUID платежа из сообщения.
             event_id: UUID Outbox/event.
+            stop: Опциональный сигнал остановки ожидания lease.
+
+        Returns:
+            ``ProcessResult`` с рекомендуемым AMQP-исходом.
+        """
+        return await self.process_payment_event(
+            payment_id=payment_id,
+            event_id=event_id,
+            event_type=OutboxEventType.PAYMENT_CREATED.value,
+            attempt=1,
+            stop=stop,
+        )
+
+    async def process_payment_event(
+        self,
+        *,
+        payment_id: uuid.UUID,
+        event_id: uuid.UUID,
+        event_type: str,
+        attempt: int,
+        stop: StopSignal | None = None,
+    ) -> ProcessResult:
+        """Обработать ``payment.created`` или ``payment.webhook_retry``.
+
+        Args:
+            payment_id: UUID платежа из сообщения.
+            event_id: UUID Outbox/event.
+            event_type: Тип события.
+            attempt: Логическая попытка webhook (1..3).
             stop: Опциональный сигнал остановки ожидания lease.
 
         Returns:
@@ -130,6 +174,24 @@ class ProcessPaymentService:
             Exception: инфраструктурные сбои БД (вызывающий не должен ACK).
         """
         started = time.perf_counter()
+        if not is_valid_event_attempt(event_type=event_type, attempt=attempt):
+            logger.error(
+                "Invalid event_type/attempt combination",
+                extra={
+                    "payment_id": str(payment_id),
+                    "event_id": str(event_id),
+                    "event_type": event_type,
+                    "attempt": attempt,
+                },
+            )
+            return ProcessResult(
+                outcome=ProcessOutcome.REJECT,
+                payment_id=payment_id,
+                business_status=None,
+                webhook_status=None,
+                detail="invalid_event_attempt",
+            )
+
         payment = await self._load_payment(payment_id)
         if payment is None:
             logger.error(
@@ -144,22 +206,16 @@ class ProcessPaymentService:
                 detail="payment_not_found",
             )
 
-        if self._is_fully_done(payment):
-            self._log_done(
-                event_id=event_id,
-                payment_id=payment_id,
-                business_status=payment.status,
-                webhook_status=payment.webhook_delivery_status,
-                started=started,
-                detail="already_delivered",
-            )
-            return ProcessResult(
-                outcome=ProcessOutcome.ACK,
-                payment_id=payment_id,
-                business_status=payment.status,
-                webhook_status=payment.webhook_delivery_status,
-                detail="already_delivered",
-            )
+        early = await self._evaluate_without_lease(
+            payment=payment,
+            payment_id=payment_id,
+            event_id=event_id,
+            event_type=event_type,
+            attempt=attempt,
+            started=started,
+        )
+        if early is not None:
+            return early
 
         acquire = await self._acquire_lease(payment_id=payment_id, stop=stop)
         if acquire.kind is _LeaseAcquireKind.NOT_FOUND:
@@ -189,6 +245,25 @@ class ProcessPaymentService:
                 webhook_status=webhook,
                 detail="already_delivered",
             )
+        if acquire.kind is _LeaseAcquireKind.EXHAUSTED:
+            payment = await self._load_payment(payment_id)
+            status = payment.status if payment else None
+            # Повтор последней попытки после exhausted → снова reject в DLQ.
+            if attempt == MAX_WEBHOOK_ATTEMPTS:
+                return ProcessResult(
+                    outcome=ProcessOutcome.REJECT,
+                    payment_id=payment_id,
+                    business_status=status,
+                    webhook_status=WebhookDeliveryStatus.EXHAUSTED.value,
+                    detail="webhook_exhausted_redelivery",
+                )
+            return ProcessResult(
+                outcome=ProcessOutcome.ACK,
+                payment_id=payment_id,
+                business_status=status,
+                webhook_status=WebhookDeliveryStatus.EXHAUSTED.value,
+                detail="webhook_exhausted_stale_event",
+            )
         if acquire.kind is _LeaseAcquireKind.BUSY or acquire.token is None:
             return ProcessResult(
                 outcome=ProcessOutcome.RETRY_LATER,
@@ -203,22 +278,152 @@ class ProcessPaymentService:
             return await self._process_under_lease(
                 payment_id=payment_id,
                 event_id=event_id,
+                event_type=event_type,
+                attempt=attempt,
                 lease_token=lease_token,
                 started=started,
             )
         except Exception:
-            # Инфраструктурный сбой: lease истечёт; сообщение не ACK'аем.
             logger.exception(
                 "Payment processing infrastructure failure",
-                extra={"payment_id": str(payment_id), "event_id": str(event_id)},
+                extra={
+                    "payment_id": str(payment_id),
+                    "event_id": str(event_id),
+                    "attempt": attempt,
+                },
             )
             raise
+
+    async def _evaluate_without_lease(
+        self,
+        *,
+        payment: PaymentModel,
+        payment_id: uuid.UUID,
+        event_id: uuid.UUID,
+        event_type: str,
+        attempt: int,
+        started: float,
+    ) -> ProcessResult | None:
+        """Быстрые идемпотентные исходы без захвата lease.
+
+        Args:
+            payment: Текущая строка платежа.
+            payment_id: UUID платежа.
+            event_id: UUID события.
+            event_type: Тип события.
+            attempt: Логическая попытка.
+            started: perf_counter старта.
+
+        Returns:
+            Готовый ``ProcessResult`` либо ``None``, если нужна дальнейшая обработка.
+        """
+        if self._is_delivered(payment):
+            self._log_done(
+                event_id=event_id,
+                payment_id=payment_id,
+                business_status=payment.status,
+                webhook_status=payment.webhook_delivery_status,
+                started=started,
+                detail="already_delivered",
+            )
+            return ProcessResult(
+                outcome=ProcessOutcome.ACK,
+                payment_id=payment_id,
+                business_status=payment.status,
+                webhook_status=payment.webhook_delivery_status,
+                detail="already_delivered",
+            )
+
+        if payment.webhook_delivery_status == WebhookDeliveryStatus.EXHAUSTED.value:
+            if attempt == MAX_WEBHOOK_ATTEMPTS:
+                return ProcessResult(
+                    outcome=ProcessOutcome.REJECT,
+                    payment_id=payment_id,
+                    business_status=payment.status,
+                    webhook_status=WebhookDeliveryStatus.EXHAUSTED.value,
+                    detail="webhook_exhausted_redelivery",
+                )
+            return ProcessResult(
+                outcome=ProcessOutcome.ACK,
+                payment_id=payment_id,
+                business_status=payment.status,
+                webhook_status=WebhookDeliveryStatus.EXHAUSTED.value,
+                detail="webhook_exhausted_stale_event",
+            )
+
+        # Устаревшее событие: уже продвинулись дальше этой попытки.
+        if payment.webhook_attempts > attempt:
+            self._log_done(
+                event_id=event_id,
+                payment_id=payment_id,
+                business_status=payment.status,
+                webhook_status=payment.webhook_delivery_status,
+                started=started,
+                detail="stale_lower_attempt",
+            )
+            return ProcessResult(
+                outcome=ProcessOutcome.ACK,
+                payment_id=payment_id,
+                business_status=payment.status,
+                webhook_status=payment.webhook_delivery_status,
+                detail="stale_lower_attempt",
+            )
+
+        # После commit failure+retry: redelivery не повторяет HTTP.
+        if (
+            payment.webhook_attempts == attempt
+            and payment.webhook_delivery_status == WebhookDeliveryStatus.PENDING.value
+        ):
+            nxt = next_webhook_attempt(failed_attempt=attempt)
+            if nxt is not None and await self._has_webhook_retry(payment_id, nxt):
+                self._log_done(
+                    event_id=event_id,
+                    payment_id=payment_id,
+                    business_status=payment.status,
+                    webhook_status=payment.webhook_delivery_status,
+                    started=started,
+                    detail="retry_already_scheduled",
+                )
+                return ProcessResult(
+                    outcome=ProcessOutcome.ACK,
+                    payment_id=payment_id,
+                    business_status=payment.status,
+                    webhook_status=payment.webhook_delivery_status,
+                    detail="retry_already_scheduled",
+                )
+
+        # Преждевременный event (attempt слишком большой относительно DB stage).
+        if (
+            payment.status != PaymentStatus.PENDING.value
+            and payment.webhook_attempts < attempt - 1
+        ):
+            logger.warning(
+                "Premature webhook attempt event; ack without HTTP",
+                extra={
+                    "payment_id": str(payment_id),
+                    "event_id": str(event_id),
+                    "event_type": event_type,
+                    "attempt": attempt,
+                    "webhook_attempts": payment.webhook_attempts,
+                },
+            )
+            return ProcessResult(
+                outcome=ProcessOutcome.ACK,
+                payment_id=payment_id,
+                business_status=payment.status,
+                webhook_status=payment.webhook_delivery_status,
+                detail="premature_attempt_quarantine",
+            )
+
+        return None
 
     async def _process_under_lease(
         self,
         *,
         payment_id: uuid.UUID,
         event_id: uuid.UUID,
+        event_type: str,
+        attempt: int,
         lease_token: datetime,
         started: float,
     ) -> ProcessResult:
@@ -227,6 +432,8 @@ class ProcessPaymentService:
         Args:
             payment_id: UUID платежа.
             event_id: UUID события.
+            event_type: Тип события.
+            attempt: Логическая попытка webhook.
             lease_token: Owner token.
             started: perf_counter старта.
 
@@ -244,25 +451,23 @@ class ProcessPaymentService:
                 detail="payment_not_found_after_claim",
             )
 
-        if self._is_fully_done(payment):
+        early = await self._evaluate_without_lease(
+            payment=payment,
+            payment_id=payment_id,
+            event_id=event_id,
+            event_type=event_type,
+            attempt=attempt,
+            started=started,
+        )
+        if early is not None:
             await self._release_lease(payment_id, lease_token)
-            self._log_done(
-                event_id=event_id,
-                payment_id=payment_id,
-                business_status=payment.status,
-                webhook_status=payment.webhook_delivery_status,
-                started=started,
-                detail="already_delivered_after_claim",
-            )
-            return ProcessResult(
-                outcome=ProcessOutcome.ACK,
-                payment_id=payment_id,
-                business_status=payment.status,
-                webhook_status=payment.webhook_delivery_status,
-                detail="already_delivered",
-            )
+            return early
 
-        if payment.status == PaymentStatus.PENDING.value:
+        # Gateway только для payment.created / pending.
+        if (
+            event_type == OutboxEventType.PAYMENT_CREATED.value
+            and payment.status == PaymentStatus.PENDING.value
+        ):
             try:
                 gateway_status = await self.gateway.charge(payment_id)
             except Exception:
@@ -306,7 +511,16 @@ class ProcessPaymentService:
                 detail="payment_missing_before_webhook",
             )
         if payment.status == PaymentStatus.PENDING.value:
+            # webhook_retry не должен видеть pending; payment.created — ждать.
             await self._release_lease(payment_id, lease_token)
+            if event_type == OutboxEventType.PAYMENT_WEBHOOK_RETRY.value:
+                return ProcessResult(
+                    outcome=ProcessOutcome.REJECT,
+                    payment_id=payment_id,
+                    business_status=payment.status,
+                    webhook_status=payment.webhook_delivery_status,
+                    detail="retry_on_non_terminal",
+                )
             return ProcessResult(
                 outcome=ProcessOutcome.RETRY_LATER,
                 payment_id=payment_id,
@@ -314,25 +528,20 @@ class ProcessPaymentService:
                 webhook_status=payment.webhook_delivery_status,
                 detail="still_pending",
             )
-        if self._is_fully_done(payment):
-            await self._release_lease(payment_id, lease_token)
-            self._log_done(
-                event_id=event_id,
-                payment_id=payment_id,
-                business_status=payment.status,
-                webhook_status=payment.webhook_delivery_status,
-                started=started,
-                detail="webhook_already_delivered",
-            )
-            return ProcessResult(
-                outcome=ProcessOutcome.ACK,
-                payment_id=payment_id,
-                business_status=payment.status,
-                webhook_status=payment.webhook_delivery_status,
-                detail="already_delivered",
-            )
 
-        await self._mark_attempt_started(payment_id, lease_token)
+        early = await self._evaluate_without_lease(
+            payment=payment,
+            payment_id=payment_id,
+            event_id=event_id,
+            event_type=event_type,
+            attempt=attempt,
+            started=started,
+        )
+        if early is not None:
+            await self._release_lease(payment_id, lease_token)
+            return early
+
+        await self._mark_attempt_started(payment_id, lease_token, attempt=attempt)
 
         processed_at = payment.processed_at or datetime.now(UTC)
         payload = build_webhook_payload(
@@ -370,36 +579,129 @@ class ProcessPaymentService:
                 detail="webhook_delivered",
             )
 
-        await self._release_lease(payment_id, lease_token)
+        return await self._handle_webhook_http_failure(
+            payment_id=payment_id,
+            event_id=event_id,
+            attempt=attempt,
+            lease_token=lease_token,
+            business_status=payment.status,
+            started=started,
+            error_class=delivery.error_class,
+            status_code=delivery.status_code,
+        )
+
+    async def _handle_webhook_http_failure(
+        self,
+        *,
+        payment_id: uuid.UUID,
+        event_id: uuid.UUID,
+        attempt: int,
+        lease_token: datetime,
+        business_status: str,
+        started: float,
+        error_class: str | None,
+        status_code: int | None,
+    ) -> ProcessResult:
+        """Зафиксировать HTTP-неуспех: retry Outbox или exhausted+REJECT.
+
+        Args:
+            payment_id: UUID платежа.
+            event_id: UUID текущего AMQP/Outbox события.
+            attempt: Номер завершившейся попытки.
+            lease_token: Owner token.
+            business_status: Неизменяемый terminal status.
+            started: perf_counter старта.
+            error_class: Класс ошибки HTTP-клиента.
+            status_code: HTTP status code или ``None``.
+
+        Returns:
+            ACK после планирования retry либо REJECT после exhausted.
+
+        Raises:
+            RuntimeError: если CAS/фиксация результата не удалась.
+        """
+        delay = self.settings.webhook_retry_delay_for_failed_attempt(attempt)
+        next_attempt = next_webhook_attempt(failed_attempt=attempt)
+
+        if next_attempt is not None and delay is not None:
+            ok = await self._record_failure_and_retry(
+                payment_id=payment_id,
+                lease_token=lease_token,
+                failed_attempt=attempt,
+                delay_seconds=delay,
+            )
+            if not ok:
+                msg = "failed to persist webhook failure and retry outbox"
+                raise RuntimeError(msg)
+            if self._on_after_webhook_failure_commit is not None:
+                await self._on_after_webhook_failure_commit()
+            logger.warning(
+                "Webhook delivery failed; retry scheduled via outbox",
+                extra={
+                    "payment_id": str(payment_id),
+                    "event_id": str(event_id),
+                    "attempt": attempt,
+                    "next_attempt": next_attempt,
+                    "delay_seconds": delay,
+                    "error_class": error_class,
+                    "status_code": status_code,
+                },
+            )
+            self._log_done(
+                event_id=event_id,
+                payment_id=payment_id,
+                business_status=business_status,
+                webhook_status=WebhookDeliveryStatus.PENDING.value,
+                started=started,
+                detail="webhook_failed_retry_scheduled",
+            )
+            return ProcessResult(
+                outcome=ProcessOutcome.ACK,
+                payment_id=payment_id,
+                business_status=business_status,
+                webhook_status=WebhookDeliveryStatus.PENDING.value,
+                detail="webhook_failed_retry_scheduled",
+            )
+
+        exhausted = await self._mark_exhausted(
+            payment_id=payment_id,
+            lease_token=lease_token,
+            failed_attempt=attempt,
+        )
+        if not exhausted:
+            msg = "failed to persist webhook exhausted"
+            raise RuntimeError(msg)
+        if self._on_after_webhook_failure_commit is not None:
+            await self._on_after_webhook_failure_commit()
         logger.warning(
-            "Webhook delivery failed; retry_deferred_until_stage_005",
+            "Webhook delivery exhausted; reject to DLQ",
             extra={
                 "payment_id": str(payment_id),
                 "event_id": str(event_id),
-                "error_class": delivery.error_class,
-                "status_code": delivery.status_code,
-                "retry_deferred_until_stage_005": True,
+                "attempt": attempt,
+                "error_class": error_class,
+                "status_code": status_code,
             },
         )
         self._log_done(
             event_id=event_id,
             payment_id=payment_id,
-            business_status=payment.status,
-            webhook_status=WebhookDeliveryStatus.PENDING.value,
+            business_status=business_status,
+            webhook_status=WebhookDeliveryStatus.EXHAUSTED.value,
             started=started,
-            detail="webhook_failed_ack_stage_004",
+            detail="webhook_exhausted",
         )
         return ProcessResult(
-            outcome=ProcessOutcome.ACK,
+            outcome=ProcessOutcome.REJECT,
             payment_id=payment_id,
-            business_status=payment.status,
-            webhook_status=WebhookDeliveryStatus.PENDING.value,
-            detail="webhook_failed_deferred_stage_005",
+            business_status=business_status,
+            webhook_status=WebhookDeliveryStatus.EXHAUSTED.value,
+            detail="webhook_exhausted",
         )
 
     @staticmethod
     def _is_fully_done(payment: PaymentModel) -> bool:
-        """Проверить terminal + webhook delivered.
+        """Проверить terminal + webhook delivered (совместимость с тестами).
 
         Args:
             payment: Строка платежа.
@@ -407,13 +709,25 @@ class ProcessPaymentService:
         Returns:
             ``True``, если повторная обработка не нужна.
         """
+        return ProcessPaymentService._is_delivered(payment)
+
+    @staticmethod
+    def _is_delivered(payment: PaymentModel) -> bool:
+        """Проверить terminal + webhook delivered.
+
+        Args:
+            payment: Строка платежа.
+
+        Returns:
+            ``True``, если webhook уже доставлен.
+        """
         return (
             payment.status != PaymentStatus.PENDING.value
             and payment.webhook_delivery_status == WebhookDeliveryStatus.DELIVERED.value
         )
 
     async def _load_payment(self, payment_id: uuid.UUID) -> PaymentModel | None:
-        """Загрузить платёж в короткой сессии.
+        """Загрузить платёж по id.
 
         Args:
             payment_id: UUID.
@@ -424,6 +738,28 @@ class ProcessPaymentService:
         async with self.session_factory() as session:
             repo = PaymentRepository(session)
             return await repo.get_by_id(payment_id)
+
+    async def _has_webhook_retry(
+        self,
+        payment_id: uuid.UUID,
+        delivery_attempt: int,
+    ) -> bool:
+        """Проверить наличие Outbox ``payment.webhook_retry`` для попытки.
+
+        Args:
+            payment_id: UUID платежа.
+            delivery_attempt: Номер попытки (2 или 3).
+
+        Returns:
+            ``True``, если запись существует.
+        """
+        async with self.session_factory() as session:
+            repo = OutboxRepository(session)
+            return await repo.has_delivery_attempt(
+                payment_id=payment_id,
+                event_type=OutboxEventType.PAYMENT_WEBHOOK_RETRY.value,
+                delivery_attempt=delivery_attempt,
+            )
 
     async def _acquire_lease(
         self,
@@ -453,10 +789,15 @@ class ProcessPaymentService:
                     payment = await repo.get_by_id(payment_id)
                     if payment is None:
                         return _LeaseAcquireResult(kind=_LeaseAcquireKind.NOT_FOUND)
-                    if self._is_fully_done(payment):
+                    if self._is_delivered(payment):
                         return _LeaseAcquireResult(
                             kind=_LeaseAcquireKind.ALREADY_DELIVERED
                         )
+                    if (
+                        payment.webhook_delivery_status
+                        == WebhookDeliveryStatus.EXHAUSTED.value
+                    ):
+                        return _LeaseAcquireResult(kind=_LeaseAcquireKind.EXHAUSTED)
 
                     if payment.status == PaymentStatus.PENDING.value:
                         token = await repo.claim_pending_for_processing(
@@ -519,12 +860,15 @@ class ProcessPaymentService:
         self,
         payment_id: uuid.UUID,
         lease_token: datetime,
+        *,
+        attempt: int,
     ) -> None:
-        """Записать webhook_attempts=1 перед HTTP.
+        """Записать ``webhook_attempts=attempt`` перед HTTP.
 
         Args:
             payment_id: UUID.
             lease_token: Owner token.
+            attempt: Номер текущей логической попытки.
 
         Raises:
             RuntimeError: если CAS владельца не удался.
@@ -535,7 +879,7 @@ class ProcessPaymentService:
                 ok = await repo.mark_webhook_attempt_started(
                     payment_id=payment_id,
                     lease_token=lease_token,
-                    attempt=1,
+                    attempt=attempt,
                 )
         if not ok:
             msg = "webhook attempt CAS failed"
@@ -561,6 +905,63 @@ class ProcessPaymentService:
                 return await repo.mark_webhook_delivered(
                     payment_id=payment_id,
                     lease_token=lease_token,
+                )
+
+    async def _record_failure_and_retry(
+        self,
+        *,
+        payment_id: uuid.UUID,
+        lease_token: datetime,
+        failed_attempt: int,
+        delay_seconds: float,
+    ) -> bool:
+        """Атомарно снять lease и вставить retry Outbox.
+
+        Args:
+            payment_id: UUID.
+            lease_token: Owner token.
+            failed_attempt: Номер завершившейся попытки.
+            delay_seconds: Задержка available_at.
+
+        Returns:
+            Успех CAS.
+        """
+        async with self.session_factory() as session:
+            async with session.begin():
+                payment_repo = PaymentRepository(session)
+                outbox_repo = OutboxRepository(session)
+                return await payment_repo.record_webhook_failure_and_schedule_retry(
+                    payment_id=payment_id,
+                    lease_token=lease_token,
+                    failed_attempt=failed_attempt,
+                    delay_seconds=delay_seconds,
+                    outbox_repo=outbox_repo,
+                )
+
+    async def _mark_exhausted(
+        self,
+        *,
+        payment_id: uuid.UUID,
+        lease_token: datetime,
+        failed_attempt: int,
+    ) -> bool:
+        """Пометить webhook exhausted.
+
+        Args:
+            payment_id: UUID.
+            lease_token: Owner token.
+            failed_attempt: Номер попытки (3).
+
+        Returns:
+            Успех CAS.
+        """
+        async with self.session_factory() as session:
+            async with session.begin():
+                repo = PaymentRepository(session)
+                return await repo.mark_webhook_exhausted(
+                    payment_id=payment_id,
+                    lease_token=lease_token,
+                    failed_attempt=failed_attempt,
                 )
 
     async def _release_lease(
