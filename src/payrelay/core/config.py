@@ -61,6 +61,11 @@ class Settings(BaseSettings):
         default=False,
         description="Разрешить private/loopback URL webhook (только test/dev).",
     )
+    webhook_connect_timeout_seconds: float = Field(
+        default=2.0,
+        gt=0,
+        description="Таймаут TCP connect для webhook HTTP.",
+    )
 
     outbox_poll_interval_seconds: float = Field(
         default=0.5,
@@ -109,9 +114,24 @@ class Settings(BaseSettings):
         description="Длительность lease обработки платежа consumer-ом.",
     )
     processing_prefetch_count: int = Field(
-        default=10,
+        default=1,
         ge=1,
         description="prefetch_count для consumer RabbitMQ.",
+    )
+    gateway_min_delay_seconds: float = Field(
+        default=2.0,
+        gt=0,
+        description="Минимальная задержка эмуляции шлюза.",
+    )
+    gateway_max_delay_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description="Максимальная задержка эмуляции шлюза.",
+    )
+    consumer_shutdown_grace_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        description="Grace timeout остановки consumer (broker/HTTP/DB).",
     )
 
     @model_validator(mode="after")
@@ -131,6 +151,39 @@ class Settings(BaseSettings):
                 "OUTBOX_LEASE_SECONDS must be >= OUTBOX_PUBLISH_TIMEOUT_SECONDS + 5 "
                 f"(got lease={self.outbox_lease_seconds}, "
                 f"confirm={self.outbox_publish_timeout_seconds})"
+            )
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_gateway_and_webhook_safety(self) -> Self:
+        """Проверить границы gateway delay, lease и private webhook flag.
+
+        Returns:
+            Валидированный экземпляр настроек.
+
+        Raises:
+            ValueError: при небезопасной или противоречивой конфигурации.
+        """
+        if self.gateway_max_delay_seconds < self.gateway_min_delay_seconds:
+            msg = "GATEWAY_MAX_DELAY_SECONDS must be >= GATEWAY_MIN_DELAY_SECONDS"
+            raise ValueError(msg)
+        # Lease должен покрывать gateway max + webhook timeout + запас.
+        min_processing_lease = (
+            self.gateway_max_delay_seconds + self.webhook_timeout_seconds + 10.0
+        )
+        if self.processing_lease_seconds < min_processing_lease:
+            msg = (
+                "PROCESSING_LEASE_SECONDS must be >= "
+                "GATEWAY_MAX_DELAY_SECONDS + WEBHOOK_TIMEOUT_SECONDS + 10 "
+                f"(got lease={self.processing_lease_seconds}, "
+                f"required>={min_processing_lease})"
+            )
+            raise ValueError(msg)
+        if self.is_production and self.webhook_allow_private_urls:
+            msg = (
+                "WEBHOOK_ALLOW_PRIVATE_URLS must be false in production "
+                "(APP_ENV=production)"
             )
             raise ValueError(msg)
         return self

@@ -136,6 +136,267 @@ class PaymentRepository:
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def claim_pending_for_processing(
+        self,
+        *,
+        payment_id: uuid.UUID,
+        lease_seconds: float,
+    ) -> datetime | None:
+        """Атомарно захватить pending-платёж под processing lease.
+
+        Args:
+            payment_id: UUID платежа.
+            lease_seconds: Длительность lease.
+
+        Returns:
+            ``processing_lease_until`` (claim token) либо ``None``, если
+            захват невозможен (не pending / чужой активный lease).
+        """
+        stmt = text(
+            """
+            UPDATE payments
+            SET processing_lease_until =
+                now() + make_interval(secs => :lease_seconds)
+            WHERE id = :payment_id
+              AND status = :pending_status
+              AND (
+                    processing_lease_until IS NULL
+                    OR processing_lease_until <= now()
+                  )
+            RETURNING processing_lease_until
+            """
+        )
+        result = await self._session.execute(
+            stmt,
+            {
+                "payment_id": payment_id,
+                "lease_seconds": float(lease_seconds),
+                "pending_status": PaymentStatus.PENDING.value,
+            },
+        )
+        return result.scalar_one_or_none()
+
+    async def claim_terminal_for_webhook(
+        self,
+        *,
+        payment_id: uuid.UUID,
+        lease_seconds: float,
+    ) -> datetime | None:
+        """Захватить lease для доставки webhook терминального платежа.
+
+        Args:
+            payment_id: UUID платежа.
+            lease_seconds: Длительность lease.
+
+        Returns:
+            Claim token либо ``None``.
+        """
+        stmt = text(
+            """
+            UPDATE payments
+            SET processing_lease_until =
+                now() + make_interval(secs => :lease_seconds)
+            WHERE id = :payment_id
+              AND status IN (:succeeded, :failed)
+              AND webhook_delivery_status = :webhook_pending
+              AND (
+                    processing_lease_until IS NULL
+                    OR processing_lease_until <= now()
+                  )
+            RETURNING processing_lease_until
+            """
+        )
+        result = await self._session.execute(
+            stmt,
+            {
+                "payment_id": payment_id,
+                "lease_seconds": float(lease_seconds),
+                "succeeded": PaymentStatus.SUCCEEDED.value,
+                "failed": PaymentStatus.FAILED.value,
+                "webhook_pending": WebhookDeliveryStatus.PENDING.value,
+            },
+        )
+        return result.scalar_one_or_none()
+
+    async def commit_terminal_status(
+        self,
+        *,
+        payment_id: uuid.UUID,
+        lease_token: datetime,
+        status: PaymentStatus,
+    ) -> bool:
+        """CAS: pending + owner token → терминальный статус (lease сохраняется).
+
+        Args:
+            payment_id: UUID платежа.
+            lease_token: ``processing_lease_until`` владельца.
+            status: ``succeeded`` или ``failed``.
+
+        Returns:
+            ``True``, если строка обновлена текущим владельцем.
+        """
+        if status not in {PaymentStatus.SUCCEEDED, PaymentStatus.FAILED}:
+            msg = f"terminal status required, got {status!r}"
+            raise ValueError(msg)
+        stmt = text(
+            """
+            UPDATE payments
+            SET
+                status = :status,
+                processed_at = now()
+            WHERE id = :payment_id
+              AND status = :pending_status
+              AND processing_lease_until = :lease_token
+            RETURNING id
+            """
+        )
+        result = await self._session.execute(
+            stmt,
+            {
+                "payment_id": payment_id,
+                "status": status.value,
+                "pending_status": PaymentStatus.PENDING.value,
+                "lease_token": lease_token,
+            },
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def mark_webhook_attempt_started(
+        self,
+        *,
+        payment_id: uuid.UUID,
+        lease_token: datetime,
+        attempt: int = 1,
+    ) -> bool:
+        """Зафиксировать начало HTTP-попытки (CAS, без повторного инкремента).
+
+        Для этапа 004 attempt=1: повторная AMQP-доставка той же первой попытки
+        не увеличивает счётчик, если он уже равен ``attempt``.
+
+        Args:
+            payment_id: UUID платежа.
+            lease_token: Owner token.
+            attempt: Номер попытки доставки (в 004 всегда 1).
+
+        Returns:
+            ``True``, если владелец обновил строку или attempt уже установлен.
+        """
+        stmt = text(
+            """
+            UPDATE payments
+            SET webhook_attempts = :attempt
+            WHERE id = :payment_id
+              AND processing_lease_until = :lease_token
+              AND webhook_delivery_status = :webhook_pending
+              AND status IN (:succeeded, :failed)
+              AND webhook_attempts < :attempt
+            RETURNING id
+            """
+        )
+        result = await self._session.execute(
+            stmt,
+            {
+                "payment_id": payment_id,
+                "lease_token": lease_token,
+                "attempt": int(attempt),
+                "webhook_pending": WebhookDeliveryStatus.PENDING.value,
+                "succeeded": PaymentStatus.SUCCEEDED.value,
+                "failed": PaymentStatus.FAILED.value,
+            },
+        )
+        if result.scalar_one_or_none() is not None:
+            return True
+        # Уже зафиксирован тот же attempt у текущего владельца — идемпотентно OK.
+        check = text(
+            """
+            SELECT id
+            FROM payments
+            WHERE id = :payment_id
+              AND processing_lease_until = :lease_token
+              AND webhook_delivery_status = :webhook_pending
+              AND webhook_attempts >= :attempt
+            """
+        )
+        existing = await self._session.execute(
+            check,
+            {
+                "payment_id": payment_id,
+                "lease_token": lease_token,
+                "webhook_pending": WebhookDeliveryStatus.PENDING.value,
+                "attempt": int(attempt),
+            },
+        )
+        return existing.scalar_one_or_none() is not None
+
+    async def mark_webhook_delivered(
+        self,
+        *,
+        payment_id: uuid.UUID,
+        lease_token: datetime,
+    ) -> bool:
+        """Отметить webhook delivered и освободить lease (CAS).
+
+        Args:
+            payment_id: UUID платежа.
+            lease_token: Owner token.
+
+        Returns:
+            ``True``, если обновление выполнено владельцем.
+        """
+        stmt = text(
+            """
+            UPDATE payments
+            SET
+                webhook_delivery_status = :delivered,
+                webhook_delivered_at = now(),
+                processing_lease_until = NULL
+            WHERE id = :payment_id
+              AND processing_lease_until = :lease_token
+              AND webhook_delivery_status = :webhook_pending
+            RETURNING id
+            """
+        )
+        result = await self._session.execute(
+            stmt,
+            {
+                "payment_id": payment_id,
+                "lease_token": lease_token,
+                "delivered": WebhookDeliveryStatus.DELIVERED.value,
+                "webhook_pending": WebhookDeliveryStatus.PENDING.value,
+            },
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def release_processing_lease(
+        self,
+        *,
+        payment_id: uuid.UUID,
+        lease_token: datetime,
+    ) -> bool:
+        """Освободить processing lease текущего владельца.
+
+        Args:
+            payment_id: UUID платежа.
+            lease_token: Owner token.
+
+        Returns:
+            ``True``, если lease сброшен владельцем.
+        """
+        stmt = text(
+            """
+            UPDATE payments
+            SET processing_lease_until = NULL
+            WHERE id = :payment_id
+              AND processing_lease_until = :lease_token
+            RETURNING id
+            """
+        )
+        result = await self._session.execute(
+            stmt,
+            {"payment_id": payment_id, "lease_token": lease_token},
+        )
+        return result.scalar_one_or_none() is not None
+
 
 class OutboxRepository:
     """Доступ к таблице outbox."""

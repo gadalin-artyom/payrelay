@@ -27,7 +27,9 @@ docker compose -f infra/compose.yaml run --rm api uv run alembic upgrade head
 
 - `api` — POST/GET платежей, health (не ждёт RabbitMQ на каждый запрос).
 - `outbox-publisher` — claim Outbox → publish confirm → `published_at`.
-- `consumer` — заглушка (обработка платежей и webhook — этап 004).
+- `consumer` — FastStream: эмуляция шлюза, terminal status, webhook HTTP.
+  При HTTP-ошибке webhook остаётся `pending` (attempts=1) и сообщение ACK'ается;
+  полноценный retry/backoff/DLQ — **этап 005** (пока не production-ready для webhook recovery).
 
 Проверка liveness (ключ из окружения контейнера / `.env`):
 
