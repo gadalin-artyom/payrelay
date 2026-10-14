@@ -1,0 +1,49 @@
+# Python / uv
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.egg-info/
+dist/
+build/
+
+# Runtime / secrets
+.env
+.env.*
+!.env.example
+!.env.test.example
+*.pem
+*.key
+*.log
+logs/
+
+# Local IDE / AI tooling: intentionally not part of service repository
+/AGENTS.md
+/SKILLS.md
+/.cursor/
+/.serena/
+/.ai/
+/.local/
+/.repomix/
+/.repomixignore
+/repomix.config.json
+/repomix-output.*
+/.mcp.json
+/.context7/
+
+# OS / IDE misc
+.DS_Store
+.idea/
+.vscode/
+
+# Docker/local transient
+*.pid
+
+/docs/

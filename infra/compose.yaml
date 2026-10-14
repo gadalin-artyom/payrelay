@@ -1,0 +1,179 @@
+# PayRelay Compose.
+# Обычный профиль: postgres, rabbitmq, api, consumer, outbox-publisher.
+# Profile `test`: postgres-test, rabbitmq-test, tests (порты наружу не публикуются).
+#
+# Миграции Alembic (`alembic upgrade head`) появятся на этапе 002;
+# до этого сервисы не выполняют upgrade.
+
+name: payrelay
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-payrelay}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-payrelay}
+      POSTGRES_DB: ${POSTGRES_DB:-payrelay}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-payrelay}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-payrelay}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: runtime
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://payrelay:payrelay@postgres:5432/payrelay}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://payrelay:payrelay@rabbitmq:5672/}
+      API_KEY: ${API_KEY:-change-me-local-api-key}
+      APP_ENV: ${APP_ENV:-development}
+      ENABLE_DOCS: ${ENABLE_DOCS:-true}
+    command: ["python", "-m", "payrelay.entrypoints.api"]
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      # Ключ берётся из окружения контейнера; в логи healthcheck его не печатаем.
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS -H \"X-API-Key: $$API_KEY\" http://127.0.0.1:8000/health/live >/dev/null",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+
+  consumer:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: runtime
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://payrelay:payrelay@postgres:5432/payrelay}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://payrelay:payrelay@rabbitmq:5672/}
+      API_KEY: ${API_KEY:-change-me-local-api-key}
+      APP_ENV: ${APP_ENV:-development}
+    command: ["python", "-m", "payrelay.entrypoints.consumer"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  outbox-publisher:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: runtime
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://payrelay:payrelay@postgres:5432/payrelay}
+      RABBITMQ_URL: ${RABBITMQ_URL:-amqp://payrelay:payrelay@rabbitmq:5672/}
+      API_KEY: ${API_KEY:-change-me-local-api-key}
+      APP_ENV: ${APP_ENV:-development}
+    command: ["python", "-m", "payrelay.entrypoints.outbox_publisher"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres-test:
+    profiles: ["test"]
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: payrelay_test
+      POSTGRES_PASSWORD: payrelay_test
+      POSTGRES_DB: payrelay_test
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+    # Порты наружу не публикуем — только Docker-сеть.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payrelay_test -d payrelay_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq-test:
+    profiles: ["test"]
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: payrelay_test
+      RABBITMQ_DEFAULT_PASS: payrelay_test
+    volumes:
+      - rabbitmq_test_data:/var/lib/rabbitmq
+    # Порты наружу не публикуем — только Docker-сеть.
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+
+  tests:
+    profiles: ["test"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: test
+    environment:
+      APP_ENV: test
+      LOG_LEVEL: INFO
+      ENABLE_DOCS: "false"
+      DATABASE_URL: postgresql+asyncpg://payrelay_test:payrelay_test@postgres-test:5432/payrelay_test
+      RABBITMQ_URL: amqp://payrelay_test:payrelay_test@rabbitmq-test:5672/
+      API_KEY: test-api-key-not-for-production
+      WEBHOOK_ALLOW_PRIVATE_URLS: "true"
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+      rabbitmq-test:
+        condition: service_healthy
+    # По умолчанию unit; integration — после этапа 002+.
+    command: ["uv", "run", "pytest", "-m", "unit"]
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  postgres_test_data:
+  rabbitmq_test_data:
